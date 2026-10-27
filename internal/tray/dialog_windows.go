@@ -5,6 +5,7 @@ package tray
 import (
 	"errors"
 	"runtime"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -21,14 +22,17 @@ const (
 	wsHScroll             = 0x00100000
 	wsPopup               = 0x80000000
 	wsClipSiblings        = 0x04000000
+	wsClipChildren        = 0x02000000
 	wsExDlgModalFrame     = 0x00000001
 	wsExControlParent     = 0x00010000
 	wsExClientEdge        = 0x00000200
 	wsExWindowEdge        = 0x00000100
+	wsExAppWindow         = 0x00040000
 	bsPushButton          = 0
 	bsDefPushButton       = 1
 	bsAutoCheckBox        = 3
 	bsGroupBox            = 7
+	bsFlat                = 0x8000
 	esAutoHScroll         = 0x80
 	esPassword            = 0x20
 	cbsDropDownList       = 3
@@ -60,6 +64,7 @@ const (
 	colorBtnFace          = 15
 	errorClassExists      = syscall.Errno(1410)
 	ofnExplorer           = 0x00080000
+	ofnEnableHook         = 0x00000020
 	ofnFileMustExist      = 0x00001000
 	ofnPathMustExist      = 0x00000800
 	ofnHideReadOnly       = 0x00000004
@@ -69,6 +74,12 @@ const (
 
 type rect struct{ Left, Top, Right, Bottom int32 }
 type size struct{ CX, CY int32 }
+
+func controlWidth(hwnd uintptr) int32 {
+	var bounds rect
+	getWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&bounds)))
+	return bounds.Right - bounds.Left
+}
 
 type openFileNameW struct {
 	StructSize    uint32
@@ -125,6 +136,7 @@ var (
 	settingsCallback     = windows.NewCallback(settingsWindowProc)
 	keysCallback         = windows.NewCallback(keysWindowProc)
 	passwordCallback     = windows.NewCallback(passwordWindowProc)
+	filePickerCallback   = windows.NewCallback(filePickerWindowProc)
 )
 
 func systemDPI() int32 {
@@ -142,6 +154,10 @@ func newMetrics() metrics {
 }
 
 func registerDialogClass(name string, proc uintptr) error {
+	small, large, err := dialogIcons()
+	if err != nil {
+		return err
+	}
 	instance, _, callErr := getModuleHandle.Call(0)
 	if instance == 0 {
 		return winErr(callErr)
@@ -156,6 +172,8 @@ func registerDialogClass(name string, proc uintptr) error {
 		WndProc:    proc,
 		Instance:   instance,
 		Cursor:     cursor,
+		Icon:       large,
+		IconSmall:  small,
 		Background: colorBtnFace + 1,
 		ClassName:  class,
 	}
@@ -168,7 +186,7 @@ func registerDialogClass(name string, proc uintptr) error {
 	return nil
 }
 
-func createPopup(class, title string, width, height int32, owner, proc uintptr) (uintptr, error) {
+func createPopup(class, title string, width, height int32, owner, proc uintptr, extraStyle ...uint32) (uintptr, error) {
 	if err := registerDialogClass(class, proc); err != nil {
 		return 0, err
 	}
@@ -185,7 +203,13 @@ func createPopup(class, title string, width, height int32, owner, proc uintptr) 
 		return 0, err
 	}
 	style := uint32(wsPopup | wsCaption | wsSysMenu | wsClipSiblings)
-	ex := uint32(wsExDlgModalFrame | wsExControlParent | wsExWindowEdge)
+	ex := uint32(wsExDlgModalFrame | wsExControlParent | wsExWindowEdge | wsExAppWindow)
+	for _, flags := range extraStyle {
+		style |= flags
+	}
+	if style&wsThickFrame != 0 {
+		ex &^= wsExDlgModalFrame
+	}
 	area := rect{Right: width, Bottom: height}
 	adjustWindowRectEx.Call(uintptr(unsafe.Pointer(&area)), uintptr(style), 0, uintptr(ex))
 	hwnd, _, callErr := createWindow.Call(
@@ -200,10 +224,71 @@ func createPopup(class, title string, width, height int32, owner, proc uintptr) 
 	if hwnd == 0 {
 		return 0, winErr(callErr)
 	}
+	if err := installFocusCues(hwnd); err != nil {
+		destroyWindow.Call(hwnd)
+		return 0, err
+	}
+	if err := installUITheme(hwnd, themePopup); err != nil {
+		destroyWindow.Call(hwnd)
+		return 0, err
+	}
+	small, large, _ := dialogIcons()
+	sendMessage.Call(hwnd, 0x0080, 0, small) // WM_SETICON / ICON_SMALL
+	sendMessage.Call(hwnd, 0x0080, 1, large) // WM_SETICON / ICON_BIG
 	return hwnd, nil
 }
 
+// Icons belong to the registered window classes and live for the process lifetime.
+var popupIcons struct {
+	sync.Once
+	small, large uintptr
+	err          error
+}
+
+func dialogIcons() (uintptr, uintptr, error) {
+	popupIcons.Do(func() {
+		data, err := assets.ReadFile("assets/tray.ico")
+		if err != nil {
+			popupIcons.err = err
+			return
+		}
+		popupIcons.small, popupIcons.err = createIcon(data, int32Result(getSystemMetrics, smCXSmallIcon), int32Result(getSystemMetrics, smCYSmallIcon))
+		if popupIcons.err != nil {
+			return
+		}
+		popupIcons.large, popupIcons.err = createIcon(data, int32Result(getSystemMetrics, 11), int32Result(getSystemMetrics, 12))
+	})
+	return popupIcons.small, popupIcons.large, popupIcons.err
+}
+
 func createChild(class, title string, style, ex uint32, x, y, w, h int32, parent, id uintptr) (uintptr, error) {
+	var border uintptr
+	if ex&wsExClientEdge != 0 {
+		ex &^= wsExClientEdge
+		style |= wsBorder
+		border = borderList
+		if class == "Edit" {
+			// The subclass owns the entire frame; a native edit border can
+			// otherwise leave themed inner edges beside the text area.
+			style &^= wsBorder
+			border = borderEdit
+		}
+	}
+	if class == "ComboBox" && style&3 == cbsDropDownList {
+		style |= 0x10 | 0x200 // CBS_OWNERDRAWFIXED | CBS_HASSTRINGS: padded native dropdown items.
+		border = borderCombo
+	}
+	if class == "Button" {
+		switch style & 0xF {
+		case bsPushButton, bsDefPushButton, bsGroupBox:
+			style |= bsFlat
+			border = borderButton
+			if style&0xF == bsGroupBox {
+				style |= wsClipSiblings
+				border = borderGroup
+			}
+		}
+	}
 	instance, _, callErr := getModuleHandle.Call(0)
 	if instance == 0 {
 		return 0, winErr(callErr)
@@ -229,6 +314,27 @@ func createChild(class, title string, style, ex uint32, x, y, w, h int32, parent
 	)
 	if hwnd == 0 {
 		return 0, winErr(callErr)
+	}
+	if border != 0 {
+		if err := setThinBorder(hwnd, border); err != nil {
+			destroyWindow.Call(hwnd)
+			return 0, err
+		}
+	}
+	if err := installFocusCues(hwnd); err != nil {
+		destroyWindow.Call(hwnd)
+		return 0, err
+	}
+	kind := uintptr(themeControl)
+	if class == "Button" {
+		kind = themeButton
+	}
+	if class == "SysListView32" {
+		kind = themeList
+	}
+	if err := installUITheme(hwnd, kind); err != nil {
+		destroyWindow.Call(hwnd)
+		return 0, err
 	}
 	return hwnd, nil
 }
@@ -263,6 +369,10 @@ func runModal(owner, hwnd uintptr) {
 			destroyWindow.Call(hwnd)
 			postQuitMessage.Call(0)
 			return
+		}
+		updateFocusCues(&msg)
+		if translateKeysMessage(&msg) {
+			continue
 		}
 		if handled, _, _ := isDialogMessage.Call(hwnd, uintptr(unsafe.Pointer(&msg))); handled != 0 {
 			continue
@@ -401,13 +511,20 @@ func listUpdateHorizontalExtent(hwnd, font uintptr, items []string) {
 	listSetHorizontalExtent(hwnd, widest)
 }
 
-func showError(owner uintptr, title string, err error) {
+func showError(owner uintptr, err error) {
 	if err == nil {
 		return
 	}
-	titlePtr, _ := windows.UTF16PtrFromString(title)
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	d := &errorDialog{}
+	if createErr := d.create(owner, err.Error()); createErr == nil {
+		runModal(owner, d.hwnd)
+		return
+	}
+	titlePtr, _ := windows.UTF16PtrFromString(errorWindowTitle)
 	textPtr, _ := windows.UTF16PtrFromString(err.Error())
-	messageBox.Call(owner, uintptr(unsafe.Pointer(textPtr)), uintptr(unsafe.Pointer(titlePtr)), mbOK|mbIconError)
+	messageBox.Call(owner, uintptr(unsafe.Pointer(textPtr)), uintptr(unsafe.Pointer(titlePtr)), mbOK)
 }
 
 func utf16Filter(pairs ...string) []uint16 {
@@ -434,7 +551,8 @@ func pickOpenFile(owner uintptr, title, initialDir, initialFile string, filter [
 		Filter:     &filterUTF16[0],
 		File:       &buf[0],
 		MaxFile:    uint32(len(buf)),
-		Flags:      ofnExplorer | ofnHideReadOnly | ofnNoChangeDir | ofnPathMustExist,
+		Flags:      ofnExplorer | ofnEnableHook | ofnHideReadOnly | ofnNoChangeDir | ofnPathMustExist,
+		Hook:       filePickerCallback,
 	}
 	if mustExist {
 		ofn.Flags |= ofnFileMustExist
@@ -452,6 +570,17 @@ func pickOpenFile(owner uintptr, title, initialDir, initialFile string, filter [
 		return "", false
 	}
 	return windows.UTF16ToString(buf), true
+}
+
+func filePickerWindowProc(window uintptr, msg uint32, wParam, lParam uintptr) uintptr {
+	if msg == 0x0110 { // WM_INITDIALOG: Explorer hooks receive a child dialog.
+		parent, _, _ := user32.NewProc("GetParent").Call(window)
+		if parent != 0 {
+			ex, _, _ := getWindowLongPtr.Call(parent, ^uintptr(19))
+			setWindowLongPtr.Call(parent, ^uintptr(19), ex|wsExAppWindow)
+		}
+	}
+	return 0
 }
 
 func commandID(wParam uintptr) uintptr { return uintptr(uint16(wParam)) }

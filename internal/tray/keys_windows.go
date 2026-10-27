@@ -3,11 +3,11 @@
 package tray
 
 import (
-	"crypto/subtle"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"github.com/masahide/OmniSSHAgent/internal/backend"
 	"golang.org/x/crypto/ssh"
@@ -15,49 +15,49 @@ import (
 )
 
 const (
-	keysClass     = "OmniSSHAgentKeysWindow"
-	passwordClass = "OmniSSHAgentPasswordWindow"
-	idKeyList     = 2201
-	idAddKey      = 2202
-	idRemoveKey   = 2203
-	idPassEdit    = 2204
+	keysClass         = "OmniSSHAgentKeysWindow"
+	passwordClass     = "OmniSSHAgentPasswordWindow"
+	idKeyList         = 2201
+	idAddKey          = 2202
+	idRemoveKey       = 2203
+	idPassEdit        = 2204
+	idRemoveAllKeys   = 2205
+	idPassFingerprint = 2206
+	idPassFilename    = 2208
+	idKeySettings     = 2207
+	wmFitKeyColumns   = wmUser + 3
+	wmDeleteKeys      = wmUser + 9
 )
-
-var errPassphraseRequired = errors.New("passphrase required")
 
 type keysDialog struct {
-	tray    *Tray
-	owner   uintptr
-	m       metrics
-	hwnd    uintptr
-	list    uintptr
-	backend backend.Backend
-	keys    []*agent.Key
-}
-
-type passwordDialog struct {
-	hwnd   uintptr
-	edit   uintptr
-	ok     bool
-	secret []byte
-}
-
-var (
-	keysDlg     *keysDialog
-	passwordDlg *passwordDialog
-)
-
-func parsePrivateKey(data, passphrase []byte) (any, error) {
-	if len(passphrase) == 0 {
-		key, err := ssh.ParseRawPrivateKey(data)
-		var missing *ssh.PassphraseMissingError
-		if errors.As(err, &missing) {
-			return nil, errPassphraseRequired
-		}
-		return key, err
+	tray           *Tray
+	owner          uintptr
+	m              metrics
+	hwnd           uintptr
+	list           uintptr
+	backend        backend.Backend
+	keys           []*agent.Key
+	keySources     map[string]backend.KeySource
+	sourceApps     map[string]sourceApp
+	sortColumn     int
+	descending     bool
+	fittingColumns bool
+	updatingKeys   bool
+	pollResults    chan keySnapshot
+	pollPending    bool
+	keysRevision   uint64
+	changeToken    uintptr
+	changePending  atomic.Bool
+	stopChanges    func()
+	importing      bool
+	headerDrag     struct {
+		active        bool
+		column        int
+		startX, width int32
 	}
-	return ssh.ParseRawPrivateKeyWithPassphrase(data, passphrase)
 }
+
+var keysDlg *keysDialog
 
 func formatListedKey(k *agent.Key) string {
 	if k == nil {
@@ -70,65 +70,28 @@ func formatListedKey(k *agent.Key) string {
 	return text
 }
 
-func clearBytes(b []byte) {
-	if len(b) == 0 {
-		return
-	}
-	zeros := make([]byte, len(b))
-	subtle.ConstantTimeCopy(1, b, zeros)
-}
-
-func addKeyFromFile(b backend.Backend, path string, askPass func() ([]byte, bool)) error {
-	if b == nil {
-		return errors.New("the SSH agent backend is unavailable")
-	}
-	if strings.EqualFold(filepath.Ext(path), ".ppk") {
-		return errors.New("PuTTY .ppk keys are not supported")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	key, err := parsePrivateKey(data, nil)
-	if errors.Is(err, errPassphraseRequired) {
-		if askPass == nil {
-			return err
-		}
-		pass, ok := askPass()
-		if !ok {
-			return errDialogCanceled
-		}
-		defer clearBytes(pass)
-		key, err = parsePrivateKey(data, pass)
-	}
-	if err != nil {
-		return err
-	}
-	return b.Add(agent.AddedKey{PrivateKey: key, Comment: filepath.Base(path)})
-}
-
 func (t *Tray) openKeys(owner uintptr) {
 	if keysDlg != nil && keysDlg.hwnd != 0 {
+		showWindow.Call(keysDlg.hwnd, 9) // SW_RESTORE
 		setForegroundWindow.Call(keysDlg.hwnd)
 		return
 	}
 	b := t.backend()
 	if b == nil {
-		showError(owner, "Manage keys", errors.New("the SSH agent backend is unavailable until the configuration is valid"))
+		showError(owner, errors.New("the SSH agent backend is unavailable until the configuration is valid"))
 		return
 	}
-	d := &keysDialog{tray: t, owner: owner, m: newMetrics(), backend: b}
+	d := &keysDialog{tray: t, owner: t.window, m: newMetrics(), backend: b}
 	keysDlg = d
-	defer func() {
-		if keysDlg == d {
-			keysDlg = nil
-		}
-	}()
 	if err := d.create(); err != nil {
-		showError(owner, "Manage keys", err)
+		keysDlg = nil
+		showError(owner, err)
 		return
 	}
-	runModal(owner, d.hwnd)
+	centerWindow(d.hwnd)
+	showWindow.Call(d.hwnd, swShow)
+	updateWindow.Call(d.hwnd)
+	setForegroundWindow.Call(d.hwnd)
 }
 
 func (t *Tray) backend() backend.Backend {
@@ -140,43 +103,56 @@ func (t *Tray) backend() backend.Backend {
 func (t *Tray) SetBackend(b backend.Backend) {
 	t.mu.Lock()
 	t.agent = b
+	window := t.window
 	t.mu.Unlock()
+	if window != 0 {
+		postMessage.Call(window, wmApply, 0, 0)
+	}
 }
 
-func (d *keysDialog) create() error {
+func (d *keysDialog) create() (err error) {
 	m := d.m
-	hwnd, err := createPopup(keysClass, "Manage keys", m.s(492), m.s(360), d.owner, keysCallback)
+	pad := m.s(12)
+	listH := m.s(240)
+	buttonY := pad + listH + m.s(8)
+	hwnd, err := createPopup(keysClass, "OpenSSHAgent – Manage Keys", m.s(780), buttonY+m.s(24)+pad, d.owner, keysCallback, wsThickFrame|wsMinimizeBox|wsMaximizeBox|wsClipChildren)
 	if err != nil {
 		return err
 	}
 	d.hwnd = hwnd
-	pad := m.s(12)
-	btnW := m.s(88)
-	btnH := m.s(24)
-	listH := m.s(240)
-	if d.list, err = d.child("ListBox", "", lbsNotify|lbsNoIntegralHeight|wsVScroll|wsHScroll|wsTabStop, wsExClientEdge, pad, pad, m.s(468), listH, idKeyList); err != nil {
-		destroyWindow.Call(hwnd)
-		d.hwnd = 0
+	defer func() {
+		if err != nil {
+			d.close()
+		}
+	}()
+	if err = d.createTable(); err != nil {
 		return err
 	}
-	buttonY := pad + listH + m.s(12)
-	if _, err = d.child("Button", "Add...", bsPushButton|wsTabStop, 0, pad, buttonY, btnW, btnH, idAddKey); err != nil {
-		destroyWindow.Call(hwnd)
-		d.hwnd = 0
-		return err
+	for _, button := range []struct {
+		text  string
+		id    uintptr
+		style uint32
+	}{
+		{"Add", idAddKey, bsPushButton},
+		{"Remove", idRemoveKey, bsPushButton},
+		{"Remove All", idRemoveAllKeys, bsPushButton},
+		{"Settings", idKeySettings, bsPushButton},
+		{"Close", idCancel, bsDefPushButton},
+	} {
+		if _, err = d.child("Button", button.text, button.style|wsTabStop, 0, 0, 0, m.s(88), m.s(24), button.id); err != nil {
+			return err
+		}
 	}
-	if _, err = d.child("Button", "Remove", bsPushButton|wsTabStop, 0, pad+btnW+m.s(8), buttonY, btnW, btnH, idRemoveKey); err != nil {
-		destroyWindow.Call(hwnd)
-		d.hwnd = 0
-		return err
-	}
-	if _, err = d.child("Button", "Close", bsDefPushButton|wsTabStop, 0, m.s(392), buttonY, btnW, btnH, idCancel); err != nil {
-		destroyWindow.Call(hwnd)
-		d.hwnd = 0
+	d.updateRemoveButtons()
+	d.layout()
+	if err := d.startLiveUpdates(); err != nil {
 		return err
 	}
 	if err := d.refresh(); err != nil {
-		showError(d.hwnd, "Manage keys", err)
+		showError(d.hwnd, err)
+	}
+	if err := d.acceptFileDrops(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -191,20 +167,12 @@ func (d *keysDialog) child(class, title string, style, ex uint32, x, y, w, h int
 }
 
 func (d *keysDialog) refresh() error {
+	d.keysRevision++ // Discard any background result predating a manual change.
 	keys, err := d.backend.List()
 	if err != nil {
 		return err
 	}
-	d.keys = keys
-	listReset(d.list)
-	labels := make([]string, 0, len(keys))
-	for _, key := range keys {
-		label := formatListedKey(key)
-		labels = append(labels, label)
-		listAdd(d.list, label)
-	}
-	listUpdateHorizontalExtent(d.list, d.m.font, labels)
-	return nil
+	return d.replaceKeys(keys)
 }
 
 func (d *keysDialog) add() {
@@ -223,33 +191,59 @@ func (d *keysDialog) add() {
 	if !ok {
 		return
 	}
-	err := addKeyFromFile(d.backend, path, func() ([]byte, bool) {
-		return promptPassphrase(d.hwnd, filepath.Base(path))
-	})
-	if err != nil {
-		if errors.Is(err, errDialogCanceled) {
-			return
-		}
-		showError(d.hwnd, "Add key", err)
+	d.addPaths([]string{path})
+}
+
+func (d *keysDialog) addPaths(paths []string) {
+	if d.importing {
 		return
 	}
-	if err := d.refresh(); err != nil {
-		showError(d.hwnd, "Manage keys", err)
+	d.importing = true
+	defer func() { d.importing = false }()
+	var failures []error
+	for _, path := range paths {
+		if d.hwnd == 0 {
+			return
+		}
+		err := addKeyFromFile(d.backend, path, func(fingerprint string) ([]byte, bool) {
+			return promptPassphrase(d.hwnd, filepath.Base(path), fingerprint)
+		})
+		if err != nil && !errors.Is(err, errDialogCanceled) {
+			failures = append(failures, err)
+		}
+	}
+	if d.hwnd == 0 {
+		return
+	}
+	if err := errors.Join(errors.Join(failures...), d.refresh()); err != nil {
+		showError(d.hwnd, err)
 	}
 }
 
 func (d *keysDialog) remove() {
-	index := listIndex(d.list)
-	if index < 0 || index >= len(d.keys) {
-		showError(d.hwnd, "Remove key", errors.New("select a key to remove"))
+	keys := d.selectedKeys()
+	if len(keys) == 0 {
+		showError(d.hwnd, errors.New("select one or more keys to remove"))
 		return
 	}
-	if err := d.backend.Remove(d.keys[index]); err != nil {
-		showError(d.hwnd, "Remove key", err)
-		return
+	var failures []error
+	for _, key := range keys {
+		if err := d.backend.Remove(key); err != nil {
+			failures = append(failures, err)
+		}
 	}
 	if err := d.refresh(); err != nil {
-		showError(d.hwnd, "Manage keys", err)
+		failures = append(failures, err)
+	}
+	if err := errors.Join(failures...); err != nil {
+		showError(d.hwnd, err)
+	}
+}
+
+func (d *keysDialog) removeAll() {
+	err := d.backend.RemoveAll()
+	if err := errors.Join(err, d.refresh()); err != nil {
+		showError(d.hwnd, err)
 	}
 }
 
@@ -266,6 +260,47 @@ func keysWindowProc(window uintptr, msg uint32, wParam, lParam uintptr) uintptr 
 		return result
 	}
 	switch msg {
+	case wmDeleteKeys:
+		if len(d.selectedKeys()) != 0 {
+			d.remove()
+		}
+		return 0
+	case wmDropFiles:
+		d.addPaths(droppedFiles(wParam))
+		return 0
+	case wmKeysChanged:
+		if wParam == d.changeToken {
+			d.changePending.Store(false)
+			_ = d.refresh()
+		}
+		return 0
+	case 0x002C: // WM_MEASUREITEM
+		if measureControlItem(lParam, d.m.s(18), 102) {
+			return 1
+		}
+	case 0x002B: // WM_DRAWITEM
+		if d.drawKeyRow(lParam) {
+			return 1
+		}
+	case 0x0113: // WM_TIMER
+		if wParam == 1 && d.pollResults != nil {
+			d.pollKeys()
+		}
+		return 0
+	case wmFitKeyColumns:
+		d.fitColumns()
+		return 0
+	case 0x0005: // WM_SIZE
+		if wParam != 1 { // SIZE_MINIMIZED
+			d.layout()
+		}
+		return 0
+	case 0x0024: // WM_GETMINMAXINFO
+		d.setMinimumSize(lParam)
+		return 0
+	case 0x004E: // WM_NOTIFY
+		d.tableNotification(lParam)
+		return 0
 	case wmCommand:
 		switch commandID(wParam) {
 		case idAddKey:
@@ -273,6 +308,12 @@ func keysWindowProc(window uintptr, msg uint32, wParam, lParam uintptr) uintptr 
 			return 0
 		case idRemoveKey:
 			d.remove()
+			return 0
+		case idKeySettings:
+			d.tray.openSettings()
+			return 0
+		case idRemoveAllKeys:
+			d.removeAll()
 			return 0
 		case idCancel, idOK:
 			d.close()
@@ -282,101 +323,15 @@ func keysWindowProc(window uintptr, msg uint32, wParam, lParam uintptr) uintptr 
 		d.close()
 		return 0
 	case wmDestroy:
+		d.clearSourceApps()
+		if d.stopChanges != nil {
+			d.stopChanges()
+			d.stopChanges = nil
+		}
+		user32.NewProc("KillTimer").Call(window, 1)
 		d.hwnd = 0
 		if keysDlg == d {
 			keysDlg = nil
-		}
-		return 0
-	}
-	result, _, _ := defWindowProc.Call(window, uintptr(msg), wParam, lParam)
-	return result
-}
-
-func promptPassphrase(owner uintptr, name string) ([]byte, bool) {
-	m := newMetrics()
-	d := &passwordDialog{}
-	passwordDlg = d
-	defer func() {
-		if passwordDlg == d {
-			passwordDlg = nil
-		}
-	}()
-	hwnd, err := createPopup(passwordClass, "Passphrase", m.s(380), m.s(168), owner, passwordCallback)
-	if err != nil {
-		showError(owner, "Passphrase", err)
-		return nil, false
-	}
-	d.hwnd = hwnd
-	pad := m.s(12)
-	label := "Enter the passphrase for " + name + "."
-	if _, err := createChild("Static", label, 0, 0, pad, pad, m.s(348), m.s(36), hwnd, 0); err != nil {
-		destroyWindow.Call(hwnd)
-		return nil, false
-	}
-	edit, err := createChild("Edit", "", esAutoHScroll|esPassword|wsTabStop, wsExClientEdge, pad, m.s(52), m.s(348), m.s(23), hwnd, idPassEdit)
-	if err != nil {
-		destroyWindow.Call(hwnd)
-		return nil, false
-	}
-	d.edit = edit
-	btnY := m.s(92)
-	if _, err := createChild("Button", "OK", bsDefPushButton|wsTabStop, 0, m.s(176), btnY, m.s(88), m.s(24), hwnd, idOK); err != nil {
-		destroyWindow.Call(hwnd)
-		return nil, false
-	}
-	if _, err := createChild("Button", "Cancel", bsPushButton|wsTabStop, 0, m.s(272), btnY, m.s(88), m.s(24), hwnd, idCancel); err != nil {
-		destroyWindow.Call(hwnd)
-		return nil, false
-	}
-	setChildFont(hwnd, m.font)
-	for _, child := range []uintptr{edit} {
-		setChildFont(child, m.font)
-	}
-	runModal(owner, hwnd)
-	if !d.ok {
-		clearBytes(d.secret)
-		return nil, false
-	}
-	return d.secret, true
-}
-
-func (d *passwordDialog) accept() {
-	text := windowText(d.edit)
-	d.secret = []byte(text)
-	d.ok = true
-	setWindowText(d.edit, "")
-	destroyWindow.Call(d.hwnd)
-}
-
-func (d *passwordDialog) cancel() {
-	d.ok = false
-	setWindowText(d.edit, "")
-	destroyWindow.Call(d.hwnd)
-}
-
-func passwordWindowProc(window uintptr, msg uint32, wParam, lParam uintptr) uintptr {
-	d := passwordDlg
-	if d == nil || (d.hwnd != 0 && d.hwnd != window) {
-		result, _, _ := defWindowProc.Call(window, uintptr(msg), wParam, lParam)
-		return result
-	}
-	switch msg {
-	case wmCommand:
-		switch commandID(wParam) {
-		case idOK:
-			d.accept()
-			return 0
-		case idCancel:
-			d.cancel()
-			return 0
-		}
-	case wmClose:
-		d.cancel()
-		return 0
-	case wmDestroy:
-		d.hwnd = 0
-		if passwordDlg == d {
-			passwordDlg = nil
 		}
 		return 0
 	}

@@ -27,12 +27,20 @@ func TestMergeSettingsValidatesAndPreservesReservedFields(t *testing.T) {
 		Pipe:           "openssh-ssh-agent",
 		ConnectTimeout: "3s",
 		LogLevel:       "DEBUG",
+		LoggingEnabled: true,
+		FluentIcon:     true,
 	})
 	if cfg.Interfaces.Pageant.Enabled {
 		t.Fatal("pageant should be disabled")
 	}
 	if cfg.Logging.Level != "debug" {
 		t.Fatalf("level=%q", cfg.Logging.Level)
+	}
+	if !cfg.Logging.IsEnabled() {
+		t.Fatal("logging flag was not saved")
+	}
+	if !cfg.Tray.FluentIcon {
+		t.Fatal("Fluent icon option was not saved")
 	}
 	if cfg.Backend.ConnectTimeout != "3s" {
 		t.Fatalf("timeout=%q", cfg.Backend.ConnectTimeout)
@@ -45,6 +53,20 @@ func TestMergeSettingsValidatesAndPreservesReservedFields(t *testing.T) {
 	}
 	if err := validateSettings(cfg, `C:\cfg.toml`, `C:\Users\tester`); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMergeKeePassXCSettings(t *testing.T) {
+	cfg := config.Default()
+	cfg.KeePassXC.Database = `C:\Secrets\test.kdbx`
+	cfg.KeePassXC.KeyLoadDelay = "3s"
+	v := settingsValues{MiddlewareEnabled: true, MiddlewareUnlock: true, MiddlewareDatabase: cfg.KeePassXC.Database, MiddlewareDatabaseEnabled: true, MiddlewareExecutableEnabled: true, MiddlewarePath: `  C:\Programs\KeePassXC\KeePassXC.exe  `}
+	cfg = mergeSettings(cfg, v)
+	if !cfg.KeePassXC.Enabled || cfg.KeePassXC.Executable != `C:\Programs\KeePassXC\KeePassXC.exe` {
+		t.Fatalf("KeePassXC settings=%+v", cfg.KeePassXC)
+	}
+	if cfg.KeePassXC.Database != `C:\Secrets\test.kdbx` || cfg.KeePassXC.KeyLoadDelay != "3s" {
+		t.Fatal("advanced settings were overwritten")
 	}
 }
 
@@ -112,7 +134,11 @@ func TestAddKeyFromFile(t *testing.T) {
 	}
 
 	asked := false
-	if err := addKeyFromFile(b, encryptedPath, func() ([]byte, bool) {
+	if err := addKeyFromFile(b, encryptedPath, func(fingerprint string) ([]byte, bool) {
+		public, err := ssh.NewSignerFromKey(encPriv)
+		if err != nil || fingerprint != ssh.FingerprintSHA256(public.PublicKey()) {
+			t.Fatalf("incorrect encrypted-key fingerprint: %q, %v", fingerprint, err)
+		}
 		asked = true
 		return []byte("secret"), true
 	}); err != nil {
@@ -148,7 +174,7 @@ func TestAddKeyFromFileCanceledPassphrase(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := testutil.NewBackend()
-	err = addKeyFromFile(b, path, func() ([]byte, bool) { return nil, false })
+	err = addKeyFromFile(b, path, func(string) ([]byte, bool) { return nil, false })
 	if !errors.Is(err, errDialogCanceled) {
 		t.Fatalf("err=%v", err)
 	}

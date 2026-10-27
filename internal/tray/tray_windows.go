@@ -20,7 +20,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-//go:embed assets/tray.ico
+//go:embed assets/tray.ico assets/openssh.ico assets/pageant.ico
 var assets embed.FS
 
 const (
@@ -34,6 +34,7 @@ const (
 	wmUser             = 0x0400
 	wmTray             = wmUser + 1
 	wmApply            = wmUser + 2
+	wmShowKeys         = wmUser + 8
 	nimAdd             = 0
 	nimModify          = 1
 	nimDelete          = 2
@@ -50,8 +51,6 @@ const (
 	swHide             = 0
 	mfString           = 0
 	mfDisabled         = 2
-	mfChecked          = 8
-	mfUnchecked        = 0
 	mfSeparator        = 0x800
 	tpmLeftAlign       = 0
 	tpmBottomAlign     = 0x20
@@ -60,9 +59,8 @@ const (
 	menuOpenConfigDir  = 1003
 	menuOpenLogDir     = 1004
 	menuSettings       = 1005
-	menuPageant        = 1006
-	menuCygwin         = 1007
-	menuAutoStart      = 1008
+	menuManageKeys     = 1006
+	menuRemoveAllKeys  = 1007
 	menuQuit           = 1009
 	smCXSmallIcon      = 49
 	smCYSmallIcon      = 50
@@ -91,7 +89,6 @@ var (
 	createPopupMenu        = user32.NewProc("CreatePopupMenu")
 	appendMenu             = user32.NewProc("AppendMenuW")
 	modifyMenu             = user32.NewProc("ModifyMenuW")
-	checkMenuItem          = user32.NewProc("CheckMenuItem")
 	destroyMenu            = user32.NewProc("DestroyMenu")
 	getCursorPos           = user32.NewProc("GetCursorPos")
 	setForegroundWindow    = user32.NewProc("SetForegroundWindow")
@@ -109,9 +106,8 @@ var (
 	createDefaultConfig    = config.CreateDefault
 	autoStartEnabled       = autostart.Enabled
 	setAutoStartEnabled    = autostart.SetEnabled
-	loadBooleanSettings    = config.LoadBooleanSettings
-	toggleBooleanSetting   = config.ToggleBooleanSetting
 	openSettingsDialog     = func(t *Tray) { t.openSettings() }
+	openKeysDialog         = func(t *Tray) { t.openKeys(t.window) }
 )
 
 type menuEntry struct {
@@ -122,17 +118,9 @@ type menuEntry struct {
 
 func requiredMenuEntries() []menuEntry {
 	return []menuEntry{
-		{mfString | mfDisabled, menuStatus, "Status: Degraded"},
-		{mfSeparator, 0, ""},
-		{mfString, menuOpenConfig, "Open configuration"},
-		{mfString, menuOpenConfigDir, "Open configuration directory"},
-		{mfString, menuOpenLogDir, "Open log directory"},
-		{mfSeparator, 0, ""},
+		{mfString, menuManageKeys, "Manage Keys"},
+		{mfString, menuRemoveAllKeys, "Remove Keys"},
 		{mfString, menuSettings, "Settings"},
-		{mfString | mfUnchecked, menuPageant, "Enable Pageant interface"},
-		{mfString | mfUnchecked, menuCygwin, "Enable Cygwin/MSYS2 interface"},
-		{mfString | mfUnchecked, menuAutoStart, "Start with Windows"},
-		{mfSeparator, 0, ""},
 		{mfString, menuQuit, "Quit"},
 	}
 }
@@ -170,17 +158,25 @@ type notifyIconData struct {
 }
 
 type Tray struct {
-	configPath         string
-	logDirectory       string
-	onQuit             func()
-	mu                 sync.Mutex
-	state              app.State
-	agent              backend.Backend
-	window, icon, menu uintptr
-	nid                notifyIconData
-	taskbarCreated     uint32
-	added              bool
-	shuttingDown       bool
+	wantKeys              bool
+	configPath            string
+	logDirectory          string
+	onQuit                func()
+	mu                    sync.Mutex
+	state                 app.State
+	agent                 backend.Backend
+	window, icon, menu    uintptr
+	nid                   notifyIconData
+	taskbarCreated        uint32
+	added                 bool
+	shuttingDown          bool
+	fluentIcon            bool
+	iconAsset             string
+	iconWidth, iconHeight int32
+	countBackend          backend.Backend
+	countToken            uintptr
+	keyCount              int
+	stopCount             func()
 }
 
 func New(configPath, logDirectory string, onQuit func()) *Tray {
@@ -213,12 +209,12 @@ func (t *Tray) Run(ctx context.Context) error {
 	activeMu.Unlock()
 	defer func() { activeMu.Lock(); active = nil; activeMu.Unlock() }()
 	if err := t.initialize(); err != nil {
-		ShowFatal("Task tray initialization failed", err)
+		ShowFatal(err)
 		return err
 	}
 	defer t.close()
 	if err := t.addIcon(); err != nil {
-		ShowFatal("Task tray initialization failed", err)
+		ShowFatal(err)
 		return err
 	}
 	go func() { <-ctx.Done(); t.quit() }()
@@ -230,6 +226,10 @@ func (t *Tray) Run(ctx context.Context) error {
 		}
 		if result == 0 {
 			return nil
+		}
+		updateFocusCues(&msg)
+		if translateKeysMessage(&msg) {
+			continue
 		}
 		translateMessage.Call(uintptr(unsafe.Pointer(&msg)))
 		dispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
@@ -251,7 +251,9 @@ func (t *Tray) initialize() error {
 	if window == 0 {
 		return winErr(callErr)
 	}
+	t.mu.Lock()
 	t.window = window
+	t.mu.Unlock()
 	showWindow.Call(window, swHide)
 	updateWindow.Call(window)
 	taskbarName, _ := windows.UTF16PtrFromString("TaskbarCreated")
@@ -260,14 +262,7 @@ func (t *Tray) initialize() error {
 		return winErr(callErr)
 	}
 	t.taskbarCreated = uint32(result)
-	iconBytes, err := assets.ReadFile("assets/tray.ico")
-	if err != nil {
-		return err
-	}
-	width := int32Result(getSystemMetrics, smCXSmallIcon)
-	height := int32Result(getSystemMetrics, smCYSmallIcon)
-	t.icon, err = createIcon(iconBytes, width, height)
-	if err != nil {
+	if err := t.refreshIcon(); err != nil {
 		return err
 	}
 	menu, _, callErr := createPopupMenu.Call()
@@ -280,7 +275,9 @@ func (t *Tray) initialize() error {
 			return err
 		}
 	}
-	_ = t.applyMenuChecks()
+	if err := styleTrayMenu(menu); err != nil {
+		return err
+	}
 	t.nid = notifyIconData{Size: uint32(unsafe.Sizeof(notifyIconData{})), Window: window, ID: 1, Flags: nifMessage | nifIcon | nifTip, Callback: wmTray, Icon: t.icon}
 	t.applyState()
 	return nil
@@ -295,17 +292,16 @@ func (t *Tray) addIcon() error {
 }
 
 func (t *Tray) applyState() {
-	t.mu.Lock()
-	state := t.state
-	t.mu.Unlock()
-	tooltip := app.Tooltip(state)
-	copyUTF16(t.nid.Tip[:], tooltip)
-	if t.added {
-		shellNotifyIcon.Call(nimModify, uintptr(unsafe.Pointer(&t.nid)))
+	_ = t.refreshIcon()
+	if keysDlg != nil && keysDlg.tray == t && keysDlg.backend != t.backend() {
+		keysDlg.close()
 	}
-	label := "Status: " + stateLabel(state)
-	ptr, _ := windows.UTF16PtrFromString(label)
-	modifyMenu.Call(t.menu, menuStatus, mfString|mfDisabled, menuStatus, uintptr(unsafe.Pointer(ptr)))
+	t.syncKeyCount()
+	t.updateKeyCountTooltip()
+	if t.wantKeys && t.backend() != nil {
+		t.wantKeys = false
+		t.command(menuManageKeys)
+	}
 }
 
 func stateLabel(state app.State) string {
@@ -320,13 +316,12 @@ func stateLabel(state app.State) string {
 }
 
 func (t *Tray) showMenu() {
-	_ = t.applyMenuChecks()
 	var p point
 	if result, _, _ := getCursorPos.Call(uintptr(unsafe.Pointer(&p))); result == 0 {
 		return
 	}
 	setForegroundWindow.Call(t.window)
-	trackPopupMenu.Call(t.menu, tpmBottomAlign|tpmLeftAlign, uintptr(p.X), uintptr(p.Y), 0, t.window, 0)
+	trackTrayMenu(t.menu, tpmBottomAlign|tpmLeftAlign, uintptr(p.X), uintptr(p.Y), t.window)
 }
 
 func (t *Tray) command(id uintptr) {
@@ -346,20 +341,10 @@ func (t *Tray) command(id uintptr) {
 		_ = openPath(t.logDirectory)
 	case menuSettings:
 		openSettingsDialog(t)
-	case menuPageant:
-		t.toggleConfigSetting(config.PageantEnabled)
-	case menuCygwin:
-		t.toggleConfigSetting(config.CygwinEnabled)
-	case menuAutoStart:
-		enabled, err := autoStartEnabled()
-		if err == nil {
-			err = setAutoStartEnabled(!enabled)
-		}
-		if err != nil {
-			ShowFatal("Auto-start setting failed", err)
-			return
-		}
-		_ = t.applyMenuChecks()
+	case menuManageKeys:
+		openKeysDialog(t)
+	case menuRemoveAllKeys:
+		t.removeAllKeys()
 	case menuQuit:
 		if t.onQuit != nil {
 			go t.onQuit()
@@ -367,38 +352,19 @@ func (t *Tray) command(id uintptr) {
 	}
 }
 
-func (t *Tray) toggleConfigSetting(setting config.BooleanSetting) {
-	if _, err := createDefaultConfig(t.configPath); err != nil {
-		ShowFatal("Configuration update failed", err)
+func (t *Tray) removeAllKeys() {
+	b := t.backend()
+	if b == nil {
+		showError(t.window, errors.New("the SSH agent backend is unavailable"))
 		return
 	}
-	if _, err := toggleBooleanSetting(t.configPath, setting); err != nil {
-		ShowFatal("Configuration update failed", err)
-		return
+	err := b.RemoveAll()
+	if keysDlg != nil && keysDlg.tray == t && keysDlg.backend == b {
+		err = errors.Join(err, keysDlg.refresh())
 	}
-	_ = t.applyMenuChecks()
-}
-
-func (t *Tray) applyMenuChecks() error {
-	settings, err := loadBooleanSettings(t.configPath)
-	if err == nil {
-		t.setMenuCheck(menuPageant, settings.PageantEnabled)
-		t.setMenuCheck(menuCygwin, settings.CygwinEnabled)
-	}
-	enabled, err := autoStartEnabled()
 	if err != nil {
-		return err
+		showError(t.window, err)
 	}
-	t.setMenuCheck(menuAutoStart, enabled)
-	return nil
-}
-
-func (t *Tray) setMenuCheck(id uintptr, enabled bool) {
-	flags := uintptr(mfUnchecked)
-	if enabled {
-		flags = mfChecked
-	}
-	checkMenuItem.Call(t.menu, id, flags)
 }
 
 func (t *Tray) quit() {
@@ -416,6 +382,7 @@ func (t *Tray) quit() {
 }
 
 func (t *Tray) close() {
+	t.stopKeyCount()
 	if t.added {
 		shellNotifyIcon.Call(nimDelete, uintptr(unsafe.Pointer(&t.nid)))
 		t.added = false
@@ -426,7 +393,9 @@ func (t *Tray) close() {
 	}
 	if t.window != 0 {
 		destroyWindow.Call(t.window)
+		t.mu.Lock()
 		t.window = 0
+		t.mu.Unlock()
 	}
 	if t.icon != 0 {
 		destroyIcon.Call(t.icon)
@@ -441,27 +410,54 @@ func windowProc(window uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	if t != nil {
 		if msg == t.taskbarCreated && msg != 0 {
 			t.added = false
+			_ = t.refreshIcon()
 			_ = t.addIcon()
 			return 0
 		}
 		switch msg {
+		case 0x002C: // WM_MEASUREITEM
+			if measureTrayMenuItem(lParam) {
+				return 1
+			}
+		case 0x002B: // WM_DRAWITEM
+			if drawTrayMenuItem(lParam) {
+				return 1
+			}
+		case 0x001A, 0x031A, 0x0015, 0x02E0: // Settings, theme, system colors, DPI.
+			refreshUITheme()
+			_ = t.refreshIcon()
 		case wmTray:
-			if uint32(lParam) == wmLButtonUp || uint32(lParam) == wmRButtonUp {
+			if uint32(lParam) == wmLButtonUp {
+				t.command(menuManageKeys)
+			} else if uint32(lParam) == wmRButtonUp {
 				t.showMenu()
 			}
 			return 0
 		case wmCommand:
 			t.command(uintptr(uint16(wParam & 0xffff)))
 			return 0
+		case wmShowKeys:
+			t.wantKeys = true
+			t.applyState()
+			return 0
 		case wmApply:
 			t.applyState()
 			return 0
+		case wmKeyCount:
+			if wParam == t.countToken {
+				t.keyCount = int(lParam)
+				t.updateKeyCountTooltip()
+			}
+			return 0
 		case wmDestroy:
+			t.stopKeyCount()
 			if t.added {
 				shellNotifyIcon.Call(nimDelete, uintptr(unsafe.Pointer(&t.nid)))
 				t.added = false
 			}
+			t.mu.Lock()
 			t.window = 0
+			t.mu.Unlock()
 			postQuitMessage.Call(0)
 			return 0
 		}
@@ -517,10 +513,8 @@ func winErr(err error) error {
 	return err
 }
 
-func ShowFatal(title string, err error) {
-	titlePtr, _ := windows.UTF16PtrFromString(title)
-	textPtr, _ := windows.UTF16PtrFromString(err.Error())
-	messageBox.Call(0, uintptr(unsafe.Pointer(textPtr)), uintptr(unsafe.Pointer(titlePtr)), mbOK|mbIconError)
+func ShowFatal(err error) {
+	showError(0, err)
 }
 
 func createIcon(ico []byte, width, height int32) (uintptr, error) {

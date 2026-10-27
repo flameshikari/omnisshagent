@@ -3,23 +3,68 @@
 package tray
 
 import (
-	"crypto/sha256"
-	"fmt"
 	"reflect"
 	"testing"
 
 	"github.com/masahide/OmniSSHAgent/internal/app"
-	"github.com/masahide/OmniSSHAgent/internal/config"
 )
 
-func TestTrayUsesOriginalOmniSSHAgentIcon(t *testing.T) {
-	icon, err := assets.ReadFile("assets/tray.ico")
-	if err != nil {
-		t.Fatal(err)
+func TestTrayIconsLoadAtSystemSizes(t *testing.T) {
+	for _, name := range []string{"assets/tray.ico"} {
+		data, err := assets.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, size := range []int32{16, 20, 24, 32, 40, 48} {
+			icon, err := createIcon(data, size, size)
+			if err != nil || icon == 0 {
+				t.Fatalf("%s at %dpx: %v", name, size, err)
+			}
+			destroyIcon.Call(icon)
+		}
 	}
-	const want = "f1510437cf0c19fc0496ad43f39c76d6e4dd2c7cf43a6d6fb5e844536554268a"
-	if got := fmt.Sprintf("%x", sha256.Sum256(icon)); got != want {
-		t.Fatalf("tray icon SHA-256=%s, want original OmniSSHAgent icon %s", got, want)
+	for _, light := range []bool{false, true} {
+		for _, size := range []int32{16, 20, 24, 32, 40, 48} {
+			icon, err := createFluentIcon(size, size, light)
+			if err != nil || icon == 0 {
+				t.Fatalf("Segoe glyph at %dpx: %v", size, err)
+			}
+			destroyIcon.Call(icon)
+		}
+	}
+}
+
+func TestTrayIconSwitchesWithThemeWithoutReplacingClassicAsset(t *testing.T) {
+	previous := taskbarUsesLightTheme
+	defer func() { taskbarUsesLightTheme = previous }()
+	light := true
+	taskbarUsesLightTheme = func() bool { return light }
+	tray := New("", "", nil)
+	defer tray.close()
+	for _, step := range []struct {
+		fluent, light bool
+		name          string
+	}{
+		{false, true, "assets/tray.ico"},
+		{true, true, "font:E192:light"},
+		{true, false, "font:E192:dark"},
+		{false, false, "assets/tray.ico"},
+	} {
+		light = step.light
+		tray.SetFluentIcon(step.fluent)
+		if err := tray.refreshIcon(); err != nil {
+			t.Fatal(err)
+		}
+		if tray.iconAsset != step.name {
+			t.Fatalf("asset=%q want=%q", tray.iconAsset, step.name)
+		}
+		icon := tray.icon
+		if err := tray.refreshIcon(); err != nil {
+			t.Fatal(err)
+		}
+		if tray.icon != icon {
+			t.Fatal("unchanged theme recreated icon")
+		}
 	}
 }
 
@@ -31,14 +76,9 @@ func TestRequiredMenu(t *testing.T) {
 		}
 	}
 	want := []string{
-		"Status: Degraded",
-		"Open configuration",
-		"Open configuration directory",
-		"Open log directory",
+		"Manage Keys",
+		"Remove Keys",
 		"Settings",
-		"Enable Pageant interface",
-		"Enable Cygwin/MSYS2 interface",
-		"Start with Windows",
 		"Quit",
 	}
 	if !reflect.DeepEqual(labels, want) {
@@ -58,26 +98,52 @@ func TestStateLabels(t *testing.T) {
 	}
 }
 
+func TestTrayLeftClickOpensKeys(t *testing.T) {
+	tray := New(`C:\Config\config.toml`, `C:\Logs`, func() {})
+	activeMu.Lock()
+	previous := active
+	active = tray
+	activeMu.Unlock()
+	previousOpen := openKeysDialog
+	defer func() {
+		openKeysDialog = previousOpen
+		activeMu.Lock()
+		active = previous
+		activeMu.Unlock()
+	}()
+	opened := 0
+	openKeysDialog = func(t *Tray) {
+		if t == tray {
+			opened++
+		}
+	}
+	windowProc(0, wmTray, 0, wmLButtonUp)
+	if opened != 1 {
+		t.Fatal("left click did not open Manage Keys")
+	}
+	tray.shuttingDown = true
+	windowProc(0, wmTray, 0, wmLButtonUp)
+	if opened != 1 {
+		t.Fatal("tray opened Manage Keys during shutdown")
+	}
+}
+
 func TestCommandsAndShutdownRejection(t *testing.T) {
 	oldOpenPath := openPath
 	oldOpenConfiguration := openConfiguration
 	oldCreateDefault := createDefaultConfig
-	oldAutoStartEnabled := autoStartEnabled
-	oldSetAutoStartEnabled := setAutoStartEnabled
-	oldLoadBooleanSettings := loadBooleanSettings
-	oldToggleBooleanSetting := toggleBooleanSetting
 	oldOpenSettings := openSettingsDialog
+	oldOpenKeys := openKeysDialog
 	defer func() {
 		openPath = oldOpenPath
 		openConfiguration = oldOpenConfiguration
 		createDefaultConfig = oldCreateDefault
-		autoStartEnabled = oldAutoStartEnabled
-		setAutoStartEnabled = oldSetAutoStartEnabled
-		loadBooleanSettings = oldLoadBooleanSettings
-		toggleBooleanSetting = oldToggleBooleanSetting
 		openSettingsDialog = oldOpenSettings
+		openKeysDialog = oldOpenKeys
 	}()
 	openSettingsDialog = func(*Tray) {}
+	keysOpened := false
+	openKeysDialog = func(*Tray) { keysOpened = true }
 	var opened []string
 	openPath = func(path string) error { opened = append(opened, path); return nil }
 	openConfiguration = func(path string) error { opened = append(opened, path); return nil }
@@ -85,48 +151,15 @@ func TestCommandsAndShutdownRejection(t *testing.T) {
 		opened = append(opened, "create:"+path)
 		return true, nil
 	}
-	autoStart := false
-	autoStartEnabled = func() (bool, error) { return autoStart, nil }
-	setAutoStartEnabled = func(enabled bool) error {
-		autoStart = enabled
-		return nil
-	}
-	booleanSettings := config.BooleanSettings{
-		PageantEnabled: true,
-		CygwinEnabled:  true,
-	}
-	loadBooleanSettings = func(string) (config.BooleanSettings, error) {
-		return booleanSettings, nil
-	}
-	toggleBooleanSetting = func(_ string, setting config.BooleanSetting) (bool, error) {
-		switch setting {
-		case config.PageantEnabled:
-			booleanSettings.PageantEnabled = !booleanSettings.PageantEnabled
-			return booleanSettings.PageantEnabled, nil
-		case config.CygwinEnabled:
-			booleanSettings.CygwinEnabled = !booleanSettings.CygwinEnabled
-			return booleanSettings.CygwinEnabled, nil
-		}
-		return false, nil
-	}
 	quit := make(chan struct{}, 2)
 	tray := New(`C:\Config\config.toml`, `C:\Logs`, func() { quit <- struct{}{} })
 	tray.command(menuOpenConfig)
 	tray.command(menuOpenConfigDir)
 	tray.command(menuOpenLogDir)
 	tray.command(menuSettings)
-	tray.command(menuPageant)
-	tray.command(menuCygwin)
-	if booleanSettings.PageantEnabled || booleanSettings.CygwinEnabled {
-		t.Fatalf("Boolean settings were not toggled: %+v", booleanSettings)
-	}
-	tray.command(menuAutoStart)
-	if !autoStart {
-		t.Fatal("auto-start was not enabled")
-	}
-	tray.command(menuAutoStart)
-	if autoStart {
-		t.Fatal("auto-start was not disabled")
+	tray.command(menuManageKeys)
+	if !keysOpened {
+		t.Fatal("key manager was not opened")
 	}
 	tray.command(menuQuit)
 	<-quit
@@ -135,8 +168,6 @@ func TestCommandsAndShutdownRejection(t *testing.T) {
 		`C:\Config\config.toml`,
 		`C:\Config`,
 		`C:\Logs`,
-		`create:C:\Config\config.toml`,
-		`create:C:\Config\config.toml`,
 	}
 	if !reflect.DeepEqual(opened, wantOpened) {
 		t.Fatalf("opened=%v, want %v", opened, wantOpened)

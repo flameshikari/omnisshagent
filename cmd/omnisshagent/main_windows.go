@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -36,6 +37,11 @@ func run(args []string) int {
 	}
 	mutex, err := singleton.Acquire(`Local\OmniSSHAgent`)
 	if errors.Is(err, singleton.ErrAlreadyRunning) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if tray.ActivateExisting(ctx) {
+			return cli.ExitOK
+		}
 		return cli.ExitAlreadyRunning
 	}
 	if err != nil {
@@ -60,8 +66,15 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return cli.ExitInternal
 	}
-	logger, logCloser := logging.New(logDir, slog.LevelInfo)
+	_, createErr := config.CreateDefault(configPath)
+	initialConfig, initialErr := config.Load(configPath)
+	var logLevel slog.LevelVar
+	logger, logCloser := logging.NewWithLevel(logDir, &logLevel)
 	defer func() { _ = logCloser.Close() }()
+	_ = logCloser.SetEnabled(initialErr == nil && initialConfig.Logging.IsEnabled())
+	previousOutput := log.Writer()
+	log.SetOutput(logCloser.Diagnostics())
+	defer log.SetOutput(previousOutput)
 	logger.Info("application starting", "version", cli.Version, "config_path", configPath)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -72,55 +85,68 @@ func run(args []string) int {
 		}
 	}()
 	t := tray.New(configPath, logDir, cancel)
+	t.SetFluentIcon(initialConfig.Tray.FluentIcon)
 	trayDone := make(chan error, 1)
 	go func() { trayDone <- t.Run(ctx) }()
 
-	_, createErr := config.CreateDefault(configPath)
-	runtimeConfig, configErr := config.LoadRuntime(configPath)
 	if createErr != nil {
-		configErr = createErr
+		logger.Error("create configuration failed", "error", createErr)
 	}
-	var application *app.Application
-	if configErr != nil {
-		logger.Error("configuration error", "error", configErr)
-		t.SetState(app.StateConfigurationError)
-	} else {
-		_ = logCloser.Close()
-		logger, logCloser = logging.New(runtimeConfig.LogDirectory, runtimeConfig.LogLevel)
-		backendClient, backendErr := newBackend(runtimeConfig)
-		if backendErr != nil {
-			logger.Error("backend initialization error", "error", backendErr)
-			t.SetState(app.StateDegraded)
-		} else {
-			t.SetBackend(backendClient)
-			application = app.New(newComponents(runtimeConfig, backendClient, logger), t, logger)
-			application.Run(ctx)
+	host := &runtimeHost{tray: t, logger: logger, level: &logLevel, logWriter: logCloser}
+	watcher := &config.Watcher{Path: configPath}
+	reload := func() {
+		changed, err := watcher.Changed()
+		if !changed {
+			return
 		}
-	}
-
-	select {
-	case err := <-trayDone:
+		var cfg config.RuntimeConfig
+		if err == nil {
+			cfg, err = config.LoadRuntime(configPath)
+		}
 		if err != nil {
-			logger.Error("tray stopped unexpectedly", "error", err)
-			return cli.ExitWindows
+			logger.Error("configuration error; previous configuration retained", "error", err)
+			t.SetState(app.StateConfigurationError)
+			return
 		}
-	case <-ctx.Done():
+		if err := host.apply(ctx, cfg); err != nil {
+			logger.Error("apply configuration failed", "error", err)
+			t.SetState(app.StateDegraded)
+		}
+	}
+	reload()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	trayStopped := false
+	exitCode := cli.ExitOK
+running:
+	for {
+		select {
+		case <-ticker.C:
+			reload()
+		case err := <-trayDone:
+			trayStopped = true
+			if err != nil {
+				logger.Error("tray stopped unexpectedly", "error", err)
+				exitCode = cli.ExitWindows
+			}
+			break running
+		case <-ctx.Done():
+			break running
+		}
 	}
 	cancel()
-	if application != nil {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer shutdownCancel()
-		if err := application.Shutdown(shutdownCtx); err != nil {
-			logger.Error("shutdown timeout", "error", err)
+	if err := host.stop(); err != nil {
+		logger.Error("shutdown timeout", "error", err)
+	}
+	if !trayStopped {
+		select {
+		case <-trayDone:
+		case <-time.After(10 * time.Second):
+			logger.Error("tray shutdown timeout")
 		}
 	}
-	select {
-	case <-trayDone:
-	case <-time.After(10 * time.Second):
-		logger.Error("tray shutdown timeout")
-	}
 	logger.Info("application stopped", "executable", filepath.Base(os.Args[0]))
-	return cli.ExitOK
+	return exitCode
 }
 
 func newBackend(runtimeConfig config.RuntimeConfig) (backend.Backend, error) {
@@ -128,7 +154,7 @@ func newBackend(runtimeConfig config.RuntimeConfig) (backend.Backend, error) {
 	case config.BackendWindowsOpenSSH:
 		return openssh.New(runtimeConfig.BackendPipePath, runtimeConfig.ConnectTimeout), nil
 	case config.BackendEmbedded:
-		return embedded.New()
+		return embedded.NewWithConfirmation(tray.ConfirmSignature)
 	default:
 		return nil, fmt.Errorf("unsupported runtime backend type %q", runtimeConfig.BackendType)
 	}
