@@ -162,7 +162,7 @@ the redesigned installation.
 5. Confirm that the legacy process and installed-application record are gone
    before installing the redesigned version.
 
-The repository's current `uninstall.ps1` is only for the redesigned
+The repository's current `scripts/uninstall.ps1` is only for the redesigned
 PowerShell installation. It does not know how to run the legacy Wails
 uninstaller and must not be used as a substitute for this step.
 
@@ -257,7 +257,7 @@ Pageant and Cygwin/MSYS2 interfaces remain independent.
 Run:
 
 ```powershell
-irm https://raw.githubusercontent.com/masahide/OmniSSHAgent/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/masahide/OmniSSHAgent/main/scripts/install.ps1 | iex
 ```
 
 The installer places the application in:
@@ -417,7 +417,7 @@ To roll back before cleanup:
 
 1. Quit the redesigned OmniSSHAgent.
 2. Disable **Start with Windows** for the redesigned application.
-3. Run the redesigned `uninstall.ps1`.
+3. Run the redesigned `scripts/uninstall.ps1`.
 4. Reinstall the retained legacy installer, if it was uninstalled.
 5. Restore the legacy shortcut, settings, and shell-profile lines from the
    backup.

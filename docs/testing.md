@@ -8,11 +8,9 @@ go vet ./...
 gofmt -w cmd internal
 go mod tidy
 ./scripts/test-installer.ps1
-go build -trimpath -o OmniSSHAgent-console.exe ./cmd/omnisshagent
-go build -trimpath -ldflags="-H=windowsgui" -o OmniSSHAgent.exe ./cmd/omnisshagent
-$env:GOOS = 'windows'
-$env:GOARCH = 'arm64'
-go build -trimpath -ldflags="-H=windowsgui" -o OmniSSHAgent-windows-arm64.exe ./cmd/omnisshagent
+./scripts/build-debug.ps1
+./scripts/build-release.ps1
+./scripts/build-release.ps1 -Architecture arm64 -OutputName OmniSSHAgent-windows-arm64.exe
 ```
 
 ## Windows E2E
@@ -140,7 +138,7 @@ The PowerShell installer integration test used the real GUI release build and
 verified first install, Start menu shortcut creation, SHA-256 rejection,
 graceful replacement of a running event-aware process, forced replacement of
 an event-incompatible legacy process, and uninstall. A separate live GUI test
-confirmed that `uninstall.ps1` stopped the real OmniSSHAgent with exit code 0
+confirmed that `scripts/uninstall.ps1` stopped the real OmniSSHAgent with exit code 0
 and removed its executable, shortcut, Cygwin socket description, and owner
 marker.
 

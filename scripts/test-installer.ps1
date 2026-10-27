@@ -5,8 +5,8 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
-$installer = Join-Path $repositoryRoot "install.ps1"
-$uninstaller = Join-Path $repositoryRoot "uninstall.ps1"
+$installer = Join-Path $PSScriptRoot "install.ps1"
+$uninstaller = Join-Path $PSScriptRoot "uninstall.ps1"
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) (
     "omnisshagent-installer-test-" + [Guid]::NewGuid().ToString("N")
 )
@@ -30,7 +30,7 @@ try {
     $asset = Join-Path $latestDirectory $assetName
     Push-Location $repositoryRoot
     try {
-        go build -trimpath -ldflags="-H=windowsgui" -o $asset ./cmd/omnisshagent
+        go build -trimpath -ldflags="-s -w -H=windowsgui" -o $asset ./cmd/omnisshagent
         if ($LASTEXITCODE -ne 0) {
             throw "test release build failed"
         }

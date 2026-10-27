@@ -1,7 +1,7 @@
 # Configuration
 
 The default file is `%APPDATA%\OmniSSHAgent\config.toml`. Unknown fields are
-rejected. Changes take effect after quitting and restarting OmniSSHAgent.
+rejected. Valid changes apply automatically; invalid edits retain the previous configuration.
 
 ```toml
 version = 1
@@ -20,8 +20,10 @@ socket_path = ""
 
 [tray]
 show_sign_notifications = false
+fluent_icon = false
 
 [logging]
+enabled = true
 level = "info"
 ```
 
@@ -35,12 +37,13 @@ level = "info"
   settings. OmniSSHAgent exposes the fixed `\\.\pipe\openssh-ssh-agent` pipe.
 - `interfaces.*.enabled` independently enables each compatibility interface.
 - The Pageant and Cygwin/MSYS2 Boolean settings can also be changed from the
-  notification-area menu or the Settings dialog. Interface and backend changes
-  take effect after restarting OmniSSHAgent.
+  Settings dialog. Changes apply automatically.
 - `tray.show_sign_notifications` is reserved for a future feature and has no
   effect in the current release.
 - An empty Cygwin path resolves to
   `%USERPROFILE%\.ssh\omnisshagent-cygwin.sock`; an override must be absolute.
+- `tray.fluent_icon` enables the system-themed Fluent tray icon.
+- `logging.enabled` switches logging on or off.
 - `logging.level` accepts `debug`, `info`, `warn`, or `error`.
 
 ## Embedded backend
@@ -58,7 +61,7 @@ The embedded keyring is process-local and ephemeral:
 - `ssh-add`, KeePassXC add/remove, Pageant, and Cygwin/MSYS2 requests use the
   same in-memory backend;
 - lifetime constraints are supported;
-- confirm-before-use requests fail explicitly; and
+- confirm-before-use (`ssh-add -c`) opens a signature confirmation dialog; and
 - lock and unlock use the SSH agent keyring behavior.
 
 Only one process can own the standard OpenSSH Named Pipe. OmniSSHAgent does not
@@ -69,8 +72,33 @@ state becomes **Degraded** while unrelated enabled interfaces continue.
 Diagnostic commands:
 
 ```powershell
-OmniSSHAgent-console.exe version
-OmniSSHAgent-console.exe config-path
-OmniSSHAgent-console.exe check-config
-OmniSSHAgent-console.exe check-config --config C:\path\to\config.toml
+.\dist\OmniSSHAgent-debug.exe version
+.\dist\OmniSSHAgent-debug.exe config-path
+.\dist\OmniSSHAgent-debug.exe check-config
+.\dist\OmniSSHAgent-debug.exe check-config --config C:\path\to\config.toml
+```
+
+## KeePassXC unlock integration
+
+Enable KeePassXC in **Settings → Middleware** to request database unlock on SSH
+agent requests. In KeePassXC, enable **Browser integration** and **Request to
+unlock the database if it is locked**. The matching `keepassxc-proxy.exe` must
+be beside KeePassXC; no browser extension is needed.
+
+Enable Start program and Executable to launch KeePassXC; Database applies only
+at startup. Leave the path options unchecked to use the running process and its
+current database.
+
+```toml
+[middleware]
+enabled = true
+program = 'keepassxc'
+
+[middleware.programs.keepassxc]
+unlock_on_request = true
+start_on_request = false
+use_executable = false
+executable = ''
+use_database = false
+database = ''
 ```

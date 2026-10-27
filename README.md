@@ -121,8 +121,8 @@ Stop-Service ssh-agent
 
 Keys can then be added through `ssh-add`,
 [KeePassXC's SSH Agent integration](https://keepassxc.org/docs/KeePassXC_UserGuide),
-or **Manage keys**. Lifetime constraints are supported. Confirm-before-use is
-rejected because this release has no confirmation UI.
+or **Manage Keys**. Lifetime constraints and signature confirmation (`ssh-add -c`)
+are supported.
 
 ## Install
 
@@ -140,7 +140,7 @@ The command must return `powershell` or `pwsh`.
 Install OmniSSHAgent:
 
 ```powershell
-irm https://raw.githubusercontent.com/masahide/OmniSSHAgent/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/masahide/OmniSSHAgent/main/scripts/install.ps1 | iex
 ```
 
 Administrator privileges are not required. The installer:
@@ -163,31 +163,16 @@ The first run creates:
 %APPDATA%\OmniSSHAgent\config.toml
 ```
 
-The notification-area menu provides:
+Left-click the tray icon to open Manage Keys; right-click for the menu.
 
-- Current application state
-- Settings
-- Pageant interface enable or disable setting
-- Cygwin/MSYS2 interface enable or disable setting
-- Start with Windows setting
-- Open configuration
-- Open configuration directory
-- Open log directory
-- Quit
+- Key import, drag-and-drop, removal, and source information.
+- Signature confirmation.
+- Live configuration reload.
+- Optional KeePassXC unlock middleware.
+- Automatic light/dark theme and optional Fluent tray icon.
+- Optional logging and Start with Windows.
 
-**Settings** opens a native dialog for the same options as `config.toml`, plus
-**Manage keys** to add or remove keys in the selected SSH agent backend.
-Interface and backend changes apply after OmniSSHAgent is restarted. Adding a
-key asks for the passphrase if the file is encrypted; neither the passphrase nor
-the private-key path is stored. In embedded mode, the loaded key is retained
-only in process memory.
-
-The **Start with Windows** setting registers OmniSSHAgent for the current user
-and does not require administrator privileges.
-
-Changes made directly to `config.toml` take effect after OmniSSHAgent is
-restarted. Pageant and Cygwin/MSYS2 enable settings can also be changed from the
-notification-area menu or the Settings dialog.
+Configure these options in Settings. Loaded embedded keys remain in memory only.
 
 ## Client setup
 
@@ -271,8 +256,10 @@ socket_path = ""
 
 [tray]
 show_sign_notifications = false
+fluent_icon = false
 
 [logging]
+enabled = true
 level = "info"
 ```
 
@@ -287,13 +274,13 @@ See [configuration](docs/configuration.md) for all available settings.
 
 ## Diagnostics
 
-The console executable provides diagnostic commands:
+The debug executable provides diagnostic commands:
 
 ```powershell
-OmniSSHAgent-console.exe version
-OmniSSHAgent-console.exe config-path
-OmniSSHAgent-console.exe check-config
-OmniSSHAgent-console.exe check-config --config C:\path\to\config.toml
+.\dist\OmniSSHAgent-debug.exe version
+.\dist\OmniSSHAgent-debug.exe config-path
+.\dist\OmniSSHAgent-debug.exe check-config
+.\dist\OmniSSHAgent-debug.exe check-config --config C:\path\to\config.toml
 ```
 
 Logs are written under:
@@ -345,12 +332,12 @@ OmniSSHAgent does not provide a persistent key store.
 
 ## Build from source
 
-Go 1.25.6 is required.
+Go 1.27.3 is required.
 
 ```powershell
-go build -trimpath -o OmniSSHAgent-console.exe ./cmd/omnisshagent
-go build -trimpath -ldflags="-H=windowsgui" -o OmniSSHAgent.exe ./cmd/omnisshagent
-.\OmniSSHAgent.exe
+./scripts/build-release.ps1
+./scripts/build-debug.ps1
+.\dist\OmniSSHAgent.exe
 ```
 
 See [development](docs/development.md) for repository structure, tests, and
@@ -367,7 +354,7 @@ Open Windows PowerShell or PowerShell 7 and confirm the current shell:
 Then run:
 
 ```powershell
-irm https://raw.githubusercontent.com/masahide/OmniSSHAgent/main/uninstall.ps1 | iex
+irm https://raw.githubusercontent.com/masahide/OmniSSHAgent/main/scripts/uninstall.ps1 | iex
 ```
 
 The uninstaller:
@@ -406,8 +393,6 @@ The current application does not provide:
 
 - Persistent private-key or passphrase storage
 - Automatic key reload after restarting the embedded backend
-- Confirm-before-use handling in the embedded backend
-- Configuration hot reload
 - Automatic updates inside the application
 - Authenticode signing
 - Log retention or size-based cleanup
