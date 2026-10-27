@@ -55,6 +55,69 @@ func TestConfiguredLevelFiltersRecords(t *testing.T) {
 	}
 }
 
+func TestDisabledLoggingCreatesNothingAndCanResume(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+	var fallback bytes.Buffer
+	writer := NewDailyWriter(dir, &fallback)
+	defer writer.Close()
+	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.Local)
+	writer.now = func() time.Time { return now }
+	logger := slog.New(slog.NewJSONHandler(writer, nil))
+	if err := writer.SetEnabled(false); err != nil {
+		t.Fatal(err)
+	}
+	logger.Info("startup must not be logged")
+	_, _ = writer.Diagnostics().Write([]byte("library output"))
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("disabled logging created directory: %v", err)
+	}
+	if fallback.Len() != 0 {
+		t.Fatal("disabled diagnostics emitted output")
+	}
+	if err := writer.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	logger.Info("enabled")
+	first := filepath.Join(dir, "omnisshagent-20261025.log")
+	before, err := os.ReadFile(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(before), "enabled") || strings.Contains(string(before), "startup") {
+		t.Fatalf("unexpected enabled output: %s", before)
+	}
+	if err := writer.SetEnabled(false); err != nil {
+		t.Fatal(err)
+	}
+	logger.Error("must not append")
+	after, err := os.ReadFile(first)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("disabled writer appended: %v", err)
+	}
+	// Renaming also verifies that the Windows file handle was closed.
+	if err := os.Rename(first, first+".saved"); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(24 * time.Hour)
+	logger.Warn("must not rotate")
+	second := filepath.Join(dir, "omnisshagent-20261026.log")
+	if _, err := os.Stat(second); !os.IsNotExist(err) {
+		t.Fatalf("disabled writer rotated: %v", err)
+	}
+	if err := writer.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	logger.Warn("resumed")
+	_, _ = writer.Diagnostics().Write([]byte("enabled diagnostic"))
+	if fallback.String() != "enabled diagnostic" {
+		t.Fatalf("diagnostics=%q", fallback.String())
+	}
+	data, err := os.ReadFile(second)
+	if err != nil || !strings.Contains(string(data), "resumed") || strings.Contains(string(data), "diagnostic") {
+		t.Fatalf("unexpected resumed output: %s err=%v", data, err)
+	}
+}
+
 func TestProductionLogCallsDoNotPassSensitivePayloadIdentifiers(t *testing.T) {
 	root := filepath.Clean(filepath.Join("..", ".."))
 	for _, dir := range []string{"cmd", "internal"} {

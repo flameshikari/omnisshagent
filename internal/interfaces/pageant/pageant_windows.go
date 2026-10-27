@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -14,26 +15,29 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/masahide/OmniSSHAgent/internal/backend"
-	"golang.org/x/crypto/ssh/agent"
+	"github.com/masahide/OmniSSHAgent/internal/interfaces/agentstream"
+	"github.com/masahide/OmniSSHAgent/internal/winsecurity"
 	"golang.org/x/sys/windows"
 )
 
 const (
-	ClassName        = "Pageant"
-	copyDataID       = 0x804e50ba
-	MaxMessageLen    = 256 * 1024
-	wmCopyData       = 0x004A
-	wmDestroy        = 0x0002
-	wmQuit           = 0x0012
-	wsPopup          = 0x80000000
-	wsExTransparent  = 0x00000020
-	wsExToolWindow   = 0x00000080
-	wsExTopmost      = 0x00000008
-	wsExNoActivate   = 0x08000000
-	fileMapAllAccess = 0xF001F
+	ClassName       = "Pageant"
+	copyDataID      = 0x804e50ba
+	MaxMessageLen   = 256 * 1024
+	wmCopyData      = 0x004A
+	wmDestroy       = 0x0002
+	wmQuit          = 0x0012
+	wsPopup         = 0x80000000
+	wsExTransparent = 0x00000020
+	wsExToolWindow  = 0x00000080
+	wsExTopmost     = 0x00000008
+	wsExNoActivate  = 0x08000000
+	fileMapAccess   = windows.FILE_MAP_READ | windows.FILE_MAP_WRITE | windows.READ_CONTROL
 )
 
 var (
@@ -44,11 +48,13 @@ var (
 	procMapViewOfFile     = kernel32.NewProc("MapViewOfFile")
 	procUnmapViewOfFile   = kernel32.NewProc("UnmapViewOfFile")
 	procRegisterClass     = user32.NewProc("RegisterClassExW")
+	procUnregisterClass   = user32.NewProc("UnregisterClassW")
 	procCreateWindow      = user32.NewProc("CreateWindowExW")
 	procFindWindow        = user32.NewProc("FindWindowW")
 	procDestroyWindow     = user32.NewProc("DestroyWindow")
 	procDefWindowProc     = user32.NewProc("DefWindowProcW")
 	procGetMessage        = user32.NewProc("GetMessageW")
+	procPeekMessage       = user32.NewProc("PeekMessageW")
 	procTranslateMessage  = user32.NewProc("TranslateMessage")
 	procDispatchMessage   = user32.NewProc("DispatchMessageW")
 	procPostThreadMessage = user32.NewProc("PostThreadMessageW")
@@ -106,6 +112,7 @@ type Component struct {
 	logger    *slog.Logger
 	ready     chan error
 	readyOnce sync.Once
+	requests  atomic.Int32
 }
 
 func New(b backend.Backend, logger *slog.Logger) *Component {
@@ -148,6 +155,7 @@ func (c *Component) Start(ctx context.Context) (resultErr error) {
 	if atom == 0 {
 		return fmt.Errorf("Pageant window class conflict: %w", windowsError(callErr))
 	}
+	defer procUnregisterClass.Call(uintptr(unsafe.Pointer(class)), instance)
 	window, _, callErr := procCreateWindow.Call(
 		wsExTransparent|wsExToolWindow|wsExTopmost|wsExNoActivate,
 		uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(class)), wsPopup,
@@ -191,7 +199,7 @@ func windowProc(window uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	if c != nil && msg == wmCopyData {
 		defer func() {
 			if recovered := recover(); recovered != nil && c.logger != nil {
-				c.logger.Error("Pageant request panic", "error", fmt.Sprint(recovered))
+				c.logger.Error("Pageant request panic")
 			}
 		}()
 		raw := memoryAt(lParam, int(unsafe.Sizeof(copyDataStruct{})))
@@ -211,6 +219,11 @@ func windowProc(window uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 }
 
 func (c *Component) handle(data *copyDataStruct) error {
+	if c.requests.Add(1) > agentstream.MaxClients {
+		c.requests.Add(-1)
+		return errors.New("too many Pageant requests")
+	}
+	defer c.requests.Add(-1)
 	if data == nil || data.Data != copyDataID {
 		return errors.New("invalid WM_COPYDATA identifier")
 	}
@@ -222,18 +235,21 @@ func (c *Component) handle(data *copyDataStruct) error {
 		return errors.New("shared memory name is not terminated")
 	}
 	name := string(nameBytes[:len(nameBytes)-1])
-	if !strings.HasPrefix(name, "PageantRequest") {
+	if !validMappingName(name) {
 		return errors.New("unexpected shared memory name")
 	}
 	namePtr, err := windows.UTF16PtrFromString(name)
 	if err != nil {
 		return err
 	}
-	handle, _, callErr := procOpenFileMapping.Call(fileMapAllAccess, 0, uintptr(unsafe.Pointer(namePtr)))
+	handle, _, callErr := procOpenFileMapping.Call(fileMapAccess, 0, uintptr(unsafe.Pointer(namePtr)))
 	if handle == 0 {
 		return fmt.Errorf("OpenFileMappingW: %w", windowsError(callErr))
 	}
 	defer windows.CloseHandle(windows.Handle(handle))
+	if err := winsecurity.RequireCurrentOwner(windows.Handle(handle)); err != nil {
+		return fmt.Errorf("verify Pageant mapping owner: %w", err)
+	}
 	address, _, callErr := procMapViewOfFile.Call(handle, windows.FILE_MAP_WRITE, 0, 0, 0)
 	if address == 0 {
 		return fmt.Errorf("MapViewOfFile: %w", windowsError(callErr))
@@ -254,10 +270,28 @@ func (c *Component) handle(data *copyDataStruct) error {
 	}
 	request := append([]byte(nil), mapped[:length+4]...)
 	var response bytes.Buffer
-	err = agent.ServeAgent(c.backend, struct {
-		io.Reader
-		io.Writer
-	}{bytes.NewReader(request), &response})
+	clientBackend := backend.ForClient(c.backend, backend.Client{PageantMapping: name, Source: "Pageant"})
+	done := make(chan error, 1)
+	go func() {
+		done <- agentstream.Serve(clientBackend, struct {
+			io.Reader
+			io.Writer
+		}{bytes.NewReader(request), &response})
+	}()
+	// PeekMessage dispatches synchronous sent messages without removing posted
+	// messages (PM_NOREMOVE). Keep accepting KeePassXC's Pageant Add requests
+	// while an identities request is waiting for its unlock dialog.
+	for {
+		select {
+		case err = <-done:
+			goto served
+		default:
+			var msg message
+			procPeekMessage.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0, 0)
+			time.Sleep(time.Millisecond)
+		}
+	}
+served:
 	if err != nil && !errors.Is(err, io.EOF) {
 		response.Reset()
 		// SSH_AGENT_FAILURE is message type 5.
@@ -268,6 +302,18 @@ func (c *Component) handle(data *copyDataStruct) error {
 	}
 	copy(mapped, response.Bytes())
 	return nil
+}
+
+func validMappingName(name string) bool {
+	if strings.HasPrefix(name, "PageantRequest") || strings.HasPrefix(name, "SSHAgentRequest") {
+		return true
+	}
+	// KeePassXC 2.8 randomizes Pageant mapping names (16 random bytes in hex).
+	if len(name) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(name)
+	return err == nil
 }
 
 func windowsError(err error) error {

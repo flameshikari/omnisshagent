@@ -259,3 +259,22 @@ func TestHandshakeRejectsNonceTimeoutAndShortPID(t *testing.T) {
 		})
 	}
 }
+
+func TestCancellationClosesUnauthenticatedClient(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server, client := net.Pipe()
+	defer client.Close()
+	component := New(nil, "unused", time.Minute, nil)
+	done := make(chan struct{})
+	go func() {
+		component.handle(ctx, server, make([]byte, 16))
+		close(done)
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cancellation left an unauthenticated client waiting")
+	}
+}

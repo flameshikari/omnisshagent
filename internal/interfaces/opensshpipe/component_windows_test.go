@@ -10,6 +10,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,8 +19,10 @@ import (
 
 	"github.com/Microsoft/go-winio"
 	"github.com/masahide/OmniSSHAgent/internal/app"
+	"github.com/masahide/OmniSSHAgent/internal/backend"
 	"github.com/masahide/OmniSSHAgent/internal/backend/embedded"
 	"github.com/masahide/OmniSSHAgent/internal/interfaces"
+	"github.com/masahide/OmniSSHAgent/internal/keepassxc"
 	"github.com/masahide/OmniSSHAgent/internal/testutil"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -26,6 +30,73 @@ import (
 )
 
 var testPipeSequence atomic.Uint64
+
+func TestDisconnectCancelsConfirmationAndAllowsNextRequest(t *testing.T) {
+	started, cancelled := make(chan struct{}), make(chan struct{})
+	var prompts atomic.Int32
+	b, err := embedded.NewWithConfirmation(func(ctx context.Context, _ ssh.PublicKey, _ string) bool {
+		if prompts.Add(1) == 1 {
+			close(started)
+			<-ctx.Done()
+			close(cancelled)
+			return true // Even a late approval must not sign the cancelled request.
+		}
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ssh.NewPublicKey(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Add(agent.AddedKey{PrivateKey: private, ConfirmBeforeUse: true}); err != nil {
+		t.Fatal(err)
+	}
+	path := uniquePipePath()
+	wrapped := keepassxc.Wrap(context.Background(), b, func(context.Context) error { return nil }, nil)
+	startComponent(t, path, wrapped)
+	client, conn := dialAgent(t, path)
+	defer conn.Close()
+	done := make(chan error, 1)
+	go func() { _, err := client.Sign(key, []byte("disconnected request")); done <- err }()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("confirmation did not start")
+	}
+	_ = conn.Close()
+	select {
+	case <-cancelled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("disconnect did not cancel confirmation")
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("disconnected signing succeeded")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("disconnected client did not return")
+	}
+	next, nextConn := dialAgent(t, path)
+	defer nextConn.Close()
+	data := []byte("new request")
+	signature, err := next.Sign(key, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := key.Verify(data, signature); err != nil {
+		t.Fatal(err)
+	}
+	if prompts.Load() != 2 {
+		t.Fatalf("confirmation count=%d, want 2", prompts.Load())
+	}
+}
 
 type stateSink struct{ state app.State }
 
@@ -286,4 +357,40 @@ func TestShutdownClosesIdleAndPartialClients(t *testing.T) {
 		t.Fatal(err)
 	}
 	running.stop(t)
+}
+
+type peerAwareBackend struct {
+	agent.ExtendedAgent
+	peer chan backend.Client
+}
+
+func (b *peerAwareBackend) ForClient(client backend.Client) backend.Backend {
+	b.peer <- client
+	return b.ExtendedAgent
+}
+
+func TestNamedPipeReportsKernelClientPID(t *testing.T) {
+	path := uniquePipePath()
+	b := &peerAwareBackend{ExtendedAgent: testBackend(t), peer: make(chan backend.Client, 1)}
+	startComponent(t, path, b)
+	client, conn := dialAgent(t, path)
+	defer conn.Close()
+	if _, err := client.List(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case peer := <-b.peer:
+		executable, err := os.Executable()
+		if err != nil || !strings.EqualFold(peer.Executable, executable) {
+			t.Fatalf("peer executable=%q want=%q err=%v", peer.Executable, executable, err)
+		}
+		if peer.Source != filepath.Base(os.Args[0]) {
+			t.Fatalf("source=%q, want current process name", peer.Source)
+		}
+		if peer.PID != uint32(os.Getpid()) {
+			t.Fatalf("peer PID=%d want=%d", peer.PID, os.Getpid())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("client metadata not delivered")
+	}
 }

@@ -184,3 +184,21 @@ func TestBackendsDoNotShareKeys(t *testing.T) {
 		t.Fatalf("new backend keys=%d err=%v", len(keys), err)
 	}
 }
+
+func TestConstraintExtensionsAreRejected(t *testing.T) {
+	b := newBackend(t)
+	public, private := newKey(t)
+	err := b.Add(agent.AddedKey{PrivateKey: private, ConstraintExtensions: []agent.ConstraintExtension{
+		{ExtensionName: "restrict-destination-v00@openssh.com", ExtensionDetails: []byte("unsupported")},
+	}})
+	if err == nil {
+		t.Fatal("unsupported key restrictions were silently discarded")
+	}
+	keys, err := b.List()
+	if err != nil || len(keys) != 0 {
+		t.Fatalf("rejected key retained: count=%d err=%v", len(keys), err)
+	}
+	if _, err := b.Sign(public, []byte("must not sign")); err == nil {
+		t.Fatal("rejected key can sign")
+	}
+}

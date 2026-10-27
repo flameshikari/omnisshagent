@@ -10,10 +10,11 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/Microsoft/go-winio"
 	"github.com/masahide/OmniSSHAgent/internal/backend"
-	"golang.org/x/crypto/ssh/agent"
+	"github.com/masahide/OmniSSHAgent/internal/interfaces/agentstream"
 	"golang.org/x/sys/windows"
 )
 
@@ -75,6 +76,7 @@ func (c *Component) Start(ctx context.Context) (resultErr error) {
 	}()
 
 	c.reportReady(nil)
+	slots := make(chan struct{}, agentstream.MaxClients)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -83,9 +85,16 @@ func (c *Component) Start(ctx context.Context) (resultErr error) {
 			}
 			return fmt.Errorf("accept OpenSSH Named Pipe client: %w", err)
 		}
+		select {
+		case slots <- struct{}{}:
+		default:
+			_ = conn.Close()
+			continue
+		}
 		clients.Add(1)
 		go func() {
 			defer clients.Done()
+			defer func() { <-slots }()
 			c.handle(runCtx, conn)
 		}()
 	}
@@ -93,24 +102,51 @@ func (c *Component) Start(ctx context.Context) (resultErr error) {
 
 func (c *Component) handle(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var peer backend.Client
+	var handle uintptr
+	if pipe, ok := conn.(interface{ Fd() uintptr }); ok {
+		handle = pipe.Fd()
+		_ = windows.GetNamedPipeClientProcessId(windows.Handle(handle), &peer.PID)
+	}
+	peer.Source, peer.Executable = clientSource(peer.PID)
+	clientBackend := backend.ForContext(backend.ForClient(c.backend, peer), ctx)
 	stopCloser := make(chan struct{})
 	closerDone := make(chan struct{})
 	go func() {
 		defer close(closerDone)
-		select {
-		case <-ctx.Done():
-			_ = conn.Close()
-		case <-stopCloser:
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				_ = conn.Close()
+				return
+			case <-stopCloser:
+				return
+			case <-ticker.C:
+				// Peek does not consume bytes or disturb the protocol reader.
+				if handle != 0 {
+					if ok, _, _ := peekNamedPipe.Call(handle, 0, 0, 0, 0, 0); ok == 0 {
+						cancel()
+						_ = conn.Close()
+						return
+					}
+				}
+			}
 		}
 	}()
 
-	err := agent.ServeAgent(c.backend, conn)
+	err := agentstream.Serve(clientBackend, &agentstream.Conn{Conn: conn})
 	close(stopCloser)
 	<-closerDone
 	if err != nil && !errors.Is(err, io.EOF) && ctx.Err() == nil && c.logger != nil {
 		c.logger.Warn("OpenSSH Named Pipe client request failed", "error", err)
 	}
 }
+
+var peekNamedPipe = windows.NewLazySystemDLL("kernel32.dll").NewProc("PeekNamedPipe")
 
 func pipeSecurityDescriptor() (string, error) {
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()

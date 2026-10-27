@@ -21,6 +21,30 @@ func TestDefaultValidate(t *testing.T) {
 	if !rt.PageantEnabled || !rt.CygwinEnabled {
 		t.Fatal("interfaces should be enabled")
 	}
+	if !rt.LoggingEnabled {
+		t.Fatal("logging should be enabled by default")
+	}
+}
+
+func TestLoggingEnabledBackwardCompatibility(t *testing.T) {
+	for _, setting := range []string{"", "enabled = true", "enabled = false"} {
+		cfg, err := Decode(strings.NewReader("[logging]\nlevel = 'info'\n" + setting))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := setting != "enabled = false"
+		if cfg.Logging.IsEnabled() != want {
+			t.Fatalf("setting=%q enabled=%v", setting, cfg.Logging.IsEnabled())
+		}
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := Save(path, cfg); err != nil {
+			t.Fatal(err)
+		}
+		reloaded, err := Load(path)
+		if err != nil || reloaded.Logging.IsEnabled() != want {
+			t.Fatalf("setting=%q round-trip failed: %v", setting, err)
+		}
+	}
 }
 
 func TestEmbeddedBackendIgnoresExternalBackendFields(t *testing.T) {

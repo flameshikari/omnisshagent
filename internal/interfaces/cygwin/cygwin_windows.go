@@ -22,7 +22,8 @@ import (
 	"time"
 
 	"github.com/masahide/OmniSSHAgent/internal/backend"
-	"golang.org/x/crypto/ssh/agent"
+	"github.com/masahide/OmniSSHAgent/internal/interfaces/agentstream"
+	"github.com/masahide/OmniSSHAgent/internal/winsecurity"
 	"golang.org/x/sys/windows"
 )
 
@@ -79,10 +80,17 @@ func (c *Component) Start(ctx context.Context) (resultErr error) {
 	defer c.cleanup(nonce)
 	c.reportReady(nil)
 
+	runCtx, cancel := context.WithCancel(ctx)
+	var clients sync.WaitGroup
+	defer func() {
+		cancel()
+		clients.Wait()
+	}()
 	go func() {
-		<-ctx.Done()
+		<-runCtx.Done()
 		listener.Close()
 	}()
+	slots := make(chan struct{}, agentstream.MaxClients)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -91,12 +99,32 @@ func (c *Component) Start(ctx context.Context) (resultErr error) {
 			}
 			return fmt.Errorf("accept Cygwin client: %w", err)
 		}
-		go c.handle(ctx, conn, nonce)
+		select {
+		case slots <- struct{}{}:
+		default:
+			_ = conn.Close()
+			continue
+		}
+		clients.Add(1)
+		go func() {
+			defer clients.Done()
+			defer func() { <-slots }()
+			c.handle(runCtx, conn, nonce)
+		}()
 	}
 }
 
 func (c *Component) handle(ctx context.Context, conn net.Conn, nonce []byte) {
 	defer conn.Close()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-done:
+		}
+	}()
 	_ = conn.SetDeadline(time.Now().Add(c.handshakeTimeout))
 	got := make([]byte, 16)
 	if _, err := io.ReadFull(conn, got); err != nil || !bytes.Equal(got, nonce) {
@@ -114,16 +142,7 @@ func (c *Component) handle(ctx context.Context, conn net.Conn, nonce []byte) {
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			conn.Close()
-		case <-done:
-		}
-	}()
-	err := agent.ServeAgent(c.backend, conn)
-	close(done)
+	err := agentstream.Serve(backend.ForClient(c.backend, backend.Client{Source: "Cygwin / MSYS2"}), &agentstream.Conn{Conn: conn})
 	if err != nil && !errors.Is(err, io.EOF) && c.logger != nil {
 		c.logger.Warn("Cygwin client request failed", "error", err)
 	}
@@ -166,16 +185,12 @@ func (c *Component) writeFiles(port int, nonce []byte) error {
 }
 
 func atomicWrite(path string, data []byte) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp")
+	tmp, err := winsecurity.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".")
 	if err != nil {
 		return err
 	}
 	name := tmp.Name()
 	defer os.Remove(name)
-	if err := tmp.Chmod(0600); err != nil {
-		tmp.Close()
-		return err
-	}
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		return err
